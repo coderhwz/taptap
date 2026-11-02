@@ -1,6 +1,7 @@
 import AppKit
 import GestureCore
 import Darwin
+import IOKit
 
 /// The private ABI is isolated here. Copy callback memory before returning to the driver.
 final class TrackpadReader {
@@ -17,8 +18,12 @@ final class TrackpadReader {
     private let lock = NSLock()
     private var epoch = 0
     private var accepting = false
+    private var notificationPort: IONotificationPortRef?
+    private var deviceIterators: [io_iterator_t] = []
+    private var deviceUpdate: DispatchWorkItem?
     var onFrame: ((AnyHashable, [Contact], TimeInterval) -> Void)?
     var onError: ((String) -> Void)?
+    var onDevicesChanged: (() -> Void)?
     private(set) var error: String?
     var deviceCount: Int { devices.count }
 
@@ -33,8 +38,13 @@ final class TrackpadReader {
     }
 
     func start() -> Bool {
-        if !devices.isEmpty { return true }
+        if notificationPort != nil { return true }
         error = nil
+        guard watchDevices() else {
+            error = "无法监听触控板接入，请手动重新启用"
+            stop()
+            return false
+        }
         guard let create = symbol("MTDeviceCreateList", as: CreateList.self),
               let register = symbol("MTRegisterContactFrameCallbackWithRefcon", as: Register.self),
               let start = symbol("MTDeviceStart", as: Start.self),
@@ -43,6 +53,7 @@ final class TrackpadReader {
               let dimensions = symbol("MTDeviceGetSensorDimensions", as: Dimensions.self),
               let list = create()?.takeRetainedValue() else {
             error = "无法读取触控板接触数据：系统接口不可用"
+            stop()
             return false
         }
         deviceList = list
@@ -62,11 +73,17 @@ final class TrackpadReader {
             }
             devices.append(device)
         }
-        if devices.isEmpty { error = "没有检测到可用触控板" }
-        return !devices.isEmpty
+        // Keep watching even with no trackpad attached, so reconnection can recover.
+        return true
     }
 
     func stop() {
+        deviceUpdate?.cancel()
+        deviceUpdate = nil
+        for iterator in deviceIterators { IOObjectRelease(iterator) }
+        deviceIterators.removeAll()
+        if let notificationPort { IONotificationPortDestroy(notificationPort) }
+        notificationPort = nil
         lock.lock()
         accepting = false
         epoch += 1
@@ -79,6 +96,49 @@ final class TrackpadReader {
         }
         devices.removeAll()
         deviceList = nil
+    }
+
+    deinit { stop() }
+
+    private func watchDevices() -> Bool {
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return false }
+        notificationPort = port
+        IONotificationPortSetDispatchQueue(port, .main)
+        for notification in [kIOFirstMatchNotification, kIOTerminatedNotification] {
+            var iterator: io_iterator_t = 0
+            let result = IOServiceAddMatchingNotification(
+                port, notification, IOServiceMatching("AppleMultitouchDevice"),
+                Self.devicesChanged, Unmanaged.passUnretained(self).toOpaque(), &iterator
+            )
+            guard result == KERN_SUCCESS else { return false }
+            deviceIterators.append(iterator)
+            // Drain the initial snapshot to arm notifications without restarting at launch.
+            Self.drain(iterator)
+        }
+        return true
+    }
+
+    private static func drain(_ iterator: io_iterator_t) {
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            IOObjectRelease(service)
+            service = IOIteratorNext(iterator)
+        }
+    }
+
+    private static let devicesChanged: IOServiceMatchingCallback = { context, iterator in
+        drain(iterator)
+        guard let context else { return }
+        let reader = Unmanaged<TrackpadReader>.fromOpaque(context).takeUnretainedValue()
+        reader.deviceUpdate?.cancel()
+        let work = DispatchWorkItem { [weak reader] in
+            guard let reader, reader.notificationPort != nil else { return }
+            reader.deviceUpdate = nil
+            reader.onDevicesChanged?()
+        }
+        reader.deviceUpdate = work
+        // Allow the multitouch framework to finish enumerating USB/Bluetooth changes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     private static let callback: Callback = { device, data, count, _, _, context in

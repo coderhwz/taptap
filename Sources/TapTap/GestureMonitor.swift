@@ -43,6 +43,13 @@ final class GestureMonitor {
         trackpad.onError = { [weak self] error in
             self?.inputs.enqueue(.failure(error))
         }
+        trackpad.onDevicesChanged = { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.stop()
+            if !self.start() {
+                self.onFailure?(self.inputError ?? "触控板更新失败，请手动重新启用")
+            }
+        }
     }
 
     func start() -> Bool {

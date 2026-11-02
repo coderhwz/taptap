@@ -8,11 +8,22 @@ final class InputTests: XCTestCase {
             throw XCTSkip("Live device access is opt-in; regular tests replay input without installing listeners")
         }
         let reader = TrackpadReader()
+        var deviceChanges = 0
+        reader.onDevicesChanged = { deviceChanges += 1 }
         guard reader.start() else { throw XCTSkip(reader.error ?? "No trackpad") }
+        defer { reader.stop() }
         XCTAssertGreaterThan(reader.deviceCount, 0)
-        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let deviceCount = reader.deviceCount
+        XCTAssertTrue(reader.start())
+        XCTAssertEqual(reader.deviceCount, deviceCount)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        XCTAssertEqual(deviceChanges, 0, "The initial device snapshot must not trigger a restart loop")
         reader.stop()
         XCTAssertEqual(reader.deviceCount, 0)
+        XCTAssertTrue(reader.start())
+        XCTAssertEqual(reader.deviceCount, deviceCount)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        XCTAssertEqual(deviceChanges, 0)
     }
 
     func testEightBindingsAreIndependentAndOldKeysArePreserved() {
